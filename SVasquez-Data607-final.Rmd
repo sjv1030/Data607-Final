@@ -1,0 +1,492 @@
+---
+title: "Betting Against Beta"
+author: "Silverio J. Vasquez"
+date: "December 8, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(RSQLite)
+require(quantmod)
+require(Quandl)
+require(tidyr)
+require(dplyr)
+require(PerformanceAnalytics)
+require(rvest)
+require(stringr)
+require(readr)
+require(data.table)
+require(ggplot2)
+require(statar)
+require(curl)
+setwd("~/Documents/bab")
+```
+
+# Betting Against Beta in the S&P 500
+
+Below is my final project for Data 607. Some new features used that weren't covered in class were `SQLite`, `data.table`, and `PerformanceAnalytics`.
+
+**BACKGROUND:**
+
+In most standard Finance 101 courses, students are taught that the higher the risk, the higher the reward (i.e., only take on more risk, if reward increases as well). This ideology is ingrained in many theories, most notably in the Capital Asset Pricing Model where the return of a stock is linearly associated to the risk sensitivity (i.e., beta) to the broader equity market (e.g., S&P 500). As a result, individuals that aren't risk averse and wanted higher returns, ended up taking on more risk in their portfolio by selecting risker (higher beta) stocks.
+
+However, in 2010, Andrea Frazzini and Lasse H. Pedersen published a paper titled "Betting Against Beta" (http://www.nber.org/papers/w16601) where they show empirically that lower beta stocks (less risky stocks) actually outperform higher beta stocks (higher risky stocks). 
+
+Many investors have been able to reproduce similar results and some have even launched investment funds following this methodology. 
+
+## DATA
+
+**Sources:**
+The data are sourced from [Wikipedia](https://en.wikipedia.org/wiki/List_of_S%26P_500_companies), [Fama and French's website](http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html), Quandl.com, and the `quantmod` R package.
+
+There is a large zip file with daily prices for a large number of stocks downloaded from [Quandl.com](https://www.Quandl.com). The only way to ensure 100% complete reproducibilbly of this project is to make this large zip file available via my [Dropbox](https://www.dropbox.com/sh/fzih0uypabr2a99/AAA_i1aa5XG1NpAQIttH2Tdna?dl=0). This file needs to be downloaded and extracted. The CSV that will be extracted is about 1.8gbs. This CSV should be extracted in the folder you'll ultimately set as your working directory and rename the CSV file to "WIKI_PRICES_ALL.csv". This working directory is also where the SQLite database will be saved with all necessary data to have subsequent analysis run more efficiently.
+
+Initially, the data will be sourced from the various sources mentioned above. Since this takes considerable time, the necessary dataframes will be saved in a SQLite database in table called "weeky_prices". This way every subsequent run of the `R` code will run smoothly.
+
+```{r data}
+
+# --------------------------------------------------------------
+# Read Fama French data from CSV file
+# --------------------------------------------------------------
+ff <- read_csv(curl("https://raw.githubusercontent.com/sjv1030/Data607-Final/master/F-F_Research_Data_5_Factors_2x3_daily.CSV"),skip=3)
+ff$X1 <- as.Date.character(ff$X1,format = "%Y%m%d")
+ff <- as.xts(ff[,-1],order.by = ff$X1)
+names(ff)[6] <- "risk.free"
+wk.end <- endpoints(ff,on="weeks")
+ff_w <- ff[wk.end,]
+plot(ff_w$risk.free,main="Risk-Free Rate")
+# --------------------------------------------------------------
+
+# --------------------------------------------------------------
+# Check if "weekly_prices" table exists in database
+# If not, then scrape Wikipedia page for S&P 500 tickers
+# And download data from Yahoo Finance via quantmod
+# Then save weekly prices to database
+# --------------------------------------------------------------
+
+# Scrape S&P500 company tickers from Wikipedia
+url <- 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+wiki <- read_html(url) %>% html_nodes('table') %>% html_table(fill = TRUE)
+names(wiki[[1]])
+sp500 <- wiki[[1]] %>% select("Ticker symbol","Security","GICS Sector","GICS Sub Industry")
+
+names(wiki[[2]])
+add_memb <- wiki[[2]][-(0:2),] %>% select("X2","X3","X4","X5")
+
+tmp <- c(sp500[,1],add_memb$X2,add_memb$X4)
+
+print(head(tmp))
+
+# Create date index
+idx <- seq(from=as.Date('2000-01-13'),to=as.Date('2017-09-07'),by="weeks")
+
+db <- dbConnect(SQLite(), dbname="betas.sqlite")  
+if (dbExistsTable(db, "weekly_prices")) {
+  # If weekly_prices table exists, pull in data from db
+  df_all <- dbGetQuery(conn=db, "SELECT * FROM weekly_prices")
+  df_all <- as.xts(df_all, order.by=idx)
+  dbDisconnect(db)
+} else {
+
+# Progress bar
+n <- length(tmp)
+pb <- txtProgressBar(min = 0, max = n, style=3)
+
+dataset <- xts() 
+for(i in 1:length(tmp)) {
+  if (tmp[i] == "") next # skip to next iteration
+  symbol <- tmp[i]
+  tryit <- try(getSymbols(symbol, from="2000-01-01", to="2017-09-30", src='yahoo'))
+  if(inherits(tryit, "try-error")){
+    i <- i+1
+  } 
+  else {
+    data <- getSymbols(symbol, from="2000-01-01", to="2017-09-30", src='yahoo')
+    dataset <- merge(dataset, Ad(get(tmp[i])))
+    rm(symbol)
+  }
+  setTxtProgressBar(pb, i)
+}
+
+# Convert dataset to weekly
+wk.end <- endpoints(dataset,on="weeks")
+data_m <- dataset[wk.end,]
+rets <- diff(log(data_m))[-1,]
+
+# Get S&P 500 (SPX) returns
+getSymbols("^GSPC", from="2000-01-01", to="2017-09-30", src="yahoo")
+spx <- Ad(GSPC)
+names(spx) <- "spx"
+wk.end <- endpoints(spx,on="weeks")
+spx_m <- spx[wk.end,]
+ret_spx <- diff(log(spx_m))[-1,]
+
+# Replace column names
+headings <- colnames(rets) %>% str_replace_all(".Adjusted","")
+names(rets) <- headings
+print('names fixed')
+
+# Identify stocks not downloaded
+filter <- tmp %in% colnames(rets)
+tmp2 <- tmp[!filter]
+
+# Use power of Data Table to read in large CSV file 
+# File has closing prices of LOTS of stocks
+# Then filter data table for stocks that were not downloaded
+# And convert from long to wide form
+system.time(w <- fread("WIKI_PRICES_ALL.csv"))
+w2 <- w[ticker %in% tmp2]
+other_stks <- w2 %>% 
+  select(date,ticker,adj_close) %>% 
+  spread(ticker, adj_close)
+
+# Convert dataset to weekly
+other_stks$date <- as.Date(other_stks$date, "%Y-%m-%d")
+other_stks.ts <- as.xts.data.table(other_stks)
+wk.end <- endpoints(other_stks,on="weeks")
+other_stks.w <- other_stks.ts[wk.end,]
+other_rets <- diff(log(other_stks.w))[-1,]
+
+# Merge returns with other_stks data frame
+rets2 <- merge.xts(rets,other_rets,join="inner")
+
+# Merge returns, SPX, and risk free rate from Fama French dataset
+rets3 <- merge.xts(rets2,ret_spx,join="inner")
+df_all <- merge.xts(rets3,ff_w$risk.free, join="inner")
+
+# Store weekly prices in database
+df_all_ <- as.data.frame(df_all)
+dbWriteTable(conn = db, name="weekly_prices", value=df_all_, overwrite=TRUE)
+
+# Disconnect database
+dbDisconnect(db)
+}
+
+# Plot a few of the stocks and return series to confirm data download
+draw <- function(x,i){
+  p <- qplot(x=index(x),y=x[,i], geom="line", xlab="",ylab="",main=colnames(x)[i])
+  print(p)
+}
+
+t <- sample(1:ncol(df_all),10,replace=FALSE)
+for (i in t){ draw(df_all,i)}
+```
+
+## METHODOLOGY
+
+**Calculate Beta:**
+
+The approach to calculating beta below differs from the one in the research paper. The methodolgy taken here is to calculate the beta as the coefficient from a rolling 2-year regression of returns less the risk-free rate using the CAPM formula. Then Blume's adjustment is applied on beta, which is the concept that long-term betas are roughly 1.
+
+The regression equation is below, which is a simple reaggrangement of the CAPM formula.
+
+**CAPM Formula**
+
+$$ Return = Riskfree Rate + \beta * (Market Return - Riskfree Rate) $$
+
+$$ (Return - Riskfree Rate) = \beta * (Market Return - Riskfree Rate) $$
+**Blume's Beta Adjustment**
+
+$$ \bar\beta = \frac{2}{3} * \beta + \frac{1}{3} * 1 $$
+
+**Got Beta?**
+
+If betas aren't in the database initially, then a FOR loop creates a dataframe of rolling regression outcomes. Only companies with at least 3-years worth of weekly returns are considered. The regression is without an intercept as illustrated in the formula above. The beta dataframe is then saved to the SQLite database in table "weekly_betas".
+
+Note: the FOR loop takes about 20mins to run.
+
+```{r beta}
+# --------------------------------------------------------------
+# Check if weekly_betas exist in database
+# If not, then calculate betas and save to database
+# --------------------------------------------------------------
+db <- dbConnect(SQLite(), dbname="betas.sqlite")  
+if (dbExistsTable(db, "weekly_betas")) {
+  # If betas database exists, pull in data this way
+  betas <- dbGetQuery(conn=db, "SELECT * FROM weekly_betas")
+  betas <- as.xts(betas,order.by = idx)
+  dbDisconnect(db)
+} else {
+n <- ncol(df_all)-2
+betas <- data.frame()
+
+# Progress bar
+pb <- txtProgressBar(min = 0, max = n, style=3)
+
+for (i in 1:n){
+  if(all(is.na(df_all[,i]))) next # skip to next iteration
+  tmp_df <- na.omit(cbind(df_all[,i],df_all$spx,df_all$risk.free))
+  tmp_df$exrt <- tmp_df[,1] - tmp_df$risk.free
+  tmp_df$spx.rf <- tmp_df$spx - tmp_df$risk.free
+
+  if(nrow(tmp_df)<52*3) next # skip to next iteration
+
+  rollingbeta <- rollapply(tmp_df,
+                           width=52*2,
+                           FUN = function(Z)
+                           {
+                             t = lm(formula=exrt~spx.rf-1, data = as.data.frame(Z), na.rm=T);
+                             return(t$coef*2/3+1/3)
+                           },
+                           by.column=FALSE, align="right")
+
+  col_name <- names(df_all)[i]
+  names(rollingbeta) <- col_name
+  betas <- merge.xts(betas,rollingbeta)
+  setTxtProgressBar(pb, i)
+}
+
+betas_ <- as.data.frame(betas)
+dbWriteTable(conn = db, name="weekly_betas", value=betas_, overwrite=TRUE)
+
+dbDisconnect(db)
+}
+# --------------------------------------------------------------
+```
+
+**Companies Not Included:**
+```{r not included}
+# --------------------------------------------------------------
+# Create logic vector to see which names companies
+# didn't have enough data to calculate a beta for
+# And print tickers of those companies
+in_in <- names(df_all) %in% names(betas)
+print(names(df_all[,!in_in]))
+# --------------------------------------------------------------
+```
+
+## RESULTS
+
+**Weekly Rebalancing:**
+
+A function called "getSig" is created, which takes a row of betas and buckets them into deciles on a weekly basis. The top 30% of betas are selected in the high_beta dataframe (stocks to be sold short) and low_beta dtaframes (stocks to be bought). 
+
+The dataframe of +1s and 0s is then multiplied to the matrix of betas. All betas receive a weight proportional to the size of the beta for each week (i.e., row). This implies weekly rebalancing of weights for stocks being traded.
+
+The returns are then aggregated into two portfolios: one that is long low-beta stocks and another that is short high-beta stocks. These two portfolios are then added together to make an equal-weighted total portfolio return (i.e., the total return an investor will receive from investing in both long and short portfolios equally).
+
+
+```{r signal}
+# Winsorize the betas dataset to handle outliers
+betas2 <- t(apply(betas,1,function(x) winsorise(x,probs = c(0.05,0.95),verbose = FALSE)))
+
+# Create two different datasets for betas above 1 and below 1
+# The result is a dataframe of beta differences from 1
+high_beta <- ifelse(betas2>1,betas2-1,0)
+low_beta <- ifelse(betas2<1,1-betas2,0)
+
+# Get signal selects top 30% of names by giving it a 1 and 0 for anything else
+getSig <- function(row) {
+  q <- quantile(row,probs=seq(0,1,0.1),na.rm=TRUE)
+  h <- ifelse(row > q[8],1,0)
+}
+
+# The getSig function is then applied to the high and low beta dataframes
+# resulting in dataframes of 1s & 0s that will serve to select the stocks
+# that will ultimately be traded
+high_sig <- t(apply(high_beta,1,getSig))
+low_sig <- t(apply(low_beta,1,getSig))
+
+high_stks <- as.matrix(high_beta) * high_sig
+low_stks <- as.matrix(low_beta) * low_sig
+
+# For each row (each week of betas), weights are created depending on
+# how far away the beta is from 1
+# The weights for the dataframe of stocks to be sold short are multiplied by -1
+short_wt <- lag(high_stks/rowSums(high_stks, na.rm = TRUE),1)[-1,]*-1
+long_wt <- lag(low_stks/rowSums(low_stks,na.rm=TRUE),1)[-1,]
+
+# The following set of code confirms that the weights for each column in total equal 1 (i.e., 100%) for each dataframe of weights
+chk_sh_wt <- apply(short_wt,1,function(x) sum(x,na.rm=TRUE))
+plot(chk_sh_wt,type="b")
+chk_lo_wt <- apply(long_wt,1,function(x) sum(x,na.rm=TRUE))
+plot(chk_lo_wt,type="b")
+
+# The following set of code shows how many stocks (roughly) will be traded
+# for each long and short side
+sh_vec <- apply(short_wt,1,function(x) sum(x<0,na.rm=TRUE))
+plot(sh_vec,type="b")
+lg_vec <- apply(long_wt,1,function(x) sum(x>0,na.rm=TRUE))
+plot(lg_vec,type="b")
+
+# There's no need for NAs anymore in the weight dataframes
+# All NAs are converted to 0s since an NA is essentially the same as not giving
+# a stock any weight in the portfolio
+# This is done to calculate portfolio returns
+long_wt[is.na(long_wt)] <- 0
+short_wt[is.na(short_wt)] <- 0
+
+# Subset returns dataframe to only have returns for stocks whose betas were calculated
+# First row is removed to match dimension of weight dataframes
+stks <- df_all[,in_in][-1,] 
+stks[is.na(stks)] <- 0 # Convert NAs to 0s
+
+# Pret_long is the portfolio return of the stocks that were bought
+# Pret_short is the portfolio return of the stocks that were sold short
+pret_long <- long_wt * stks
+pret_short <- short_wt * stks
+
+# P is the sum (really weighted sum given returns were multiplied by weights above) of all the returns of stocks that were bought on a weekly 
+# Same is true for S for the stocks that were sold short on a weekly basis
+p <- apply(pret_long,1,sum) 
+s <- apply(pret_short,1,sum)
+pt <- cbind.data.frame(p,s) # combine both p & s into a dataframe
+idx <- seq(as.Date("2000-01-20"),as.Date("2017-09-07"),by = "week")
+pt <- as.xts(pt,order.by = idx) # convert to xts object
+f <- p + s # calculate total portfolio return if long and short portfolios were equal weighted
+f.ts <- as.xts(f,order.by = idx) # convert total portfolio return to xts object
+
+# Cumulative return is then calculated and plotted. Anything below the horizontal line means the investment lost money. Other performance statistics are then plotted using functions from the PerformanceAnalytics package.
+cumret <- cumprod(1+f.ts)
+plot.xts(cumret)
+abline(h=1)
+charts.PerformanceSummary(f.ts)
+Return.annualized(f.ts)
+SharpeRatio.annualized(f.ts)
+```
+
+**General Rebalancing:**
+
+The code above is then modified slightly so that it can be called as a function taking in only one paramater - frequency of rebalance. The options are weekly (default setting), monthly, quarterly, or annually.
+
+```{r general-rebal}
+bab_test <- function(x="week"){
+  t_endpoints <- endpoints(betas,x)
+  betas_ <- betas[t_endpoints,]
+  betas2 <- t(apply(betas_,1,function(x) winsorise(x,probs = c(0.05,0.95),verbose = FALSE)))
+
+  # Create two different datasets for betas above 1 and below 1
+  # The result is a dataframe of beta differences from 1
+  high_beta <- ifelse(betas2>1,betas2-1,0)
+  low_beta <- ifelse(betas2<1,1-betas2,0)
+  
+  # Get signal selects top 30% of names by giving it a 1 and 0 for anything else
+  getSig <- function(row) {
+    q <- quantile(row,probs=seq(0,1,0.1),na.rm=TRUE)
+    h <- ifelse(row > q[8],1,0)
+  }
+  
+  # The getSig function is then applied to the high and low beta dataframes
+  # resulting in dataframes of 1s & 0s that will serve to select the stocks
+  # that will ultimately be traded
+  high_sig <- t(apply(high_beta,1,getSig))
+  low_sig <- t(apply(low_beta,1,getSig))
+  
+  high_stks <- as.matrix(high_beta) * high_sig
+  low_stks <- as.matrix(low_beta) * low_sig
+  
+  # For each row (each week of betas), weights are created depending on
+  # how far away the beta is from 1
+  # The weights for the dataframe of stocks to be sold short are multiplied by -1
+  short_wt <- lag(high_stks/rowSums(high_stks, na.rm = TRUE),1)[-1,]*-1
+  long_wt <- lag(low_stks/rowSums(low_stks,na.rm=TRUE),1)[-1,]
+  
+  # The following set of code confirms that the weights for each column in total equal 1 (i.e., 100%) for each dataframe of weights. Weights are 0 in beginning when there aren't any betas.
+  chk_sh_wt <- apply(short_wt,1,function(x) sum(x,na.rm=TRUE))
+  plot(chk_sh_wt,type="b",main="Total Weight of Stocks in Short Portfolio")
+  chk_lo_wt <- apply(long_wt,1,function(x) sum(x,na.rm=TRUE))
+  plot(chk_lo_wt,type="b",main="Total Weight of Stocks in Long Portfolio")
+  
+  # There's no need for NAs anymore in the weight dataframes
+  # All NAs are converted to 0s since an NA is essentially the same as not giving
+  # a stock any weight in the portfolio
+  # This is done to calculate portfolio returns
+  long_wt[is.na(long_wt)] <- 0
+  short_wt[is.na(short_wt)] <- 0
+  if (x == "week" || x == "months"){
+    idx <- seq(as.Date("2000-01-20"),as.Date("2017-09-07"),by = x)
+  } else if(x == "quarter") {
+    idx <- seq(as.Date("2000-06-01"),as.Date("2017-09-01"),by = x)
+  } else {
+    idx <- seq(as.Date("2001-01-01"),as.Date("2017-09-01"),by = x)
+  }
+  long_wt <- as.xts(long_wt,order.by=idx)
+  short_wt <- as.xts(short_wt,order.by=idx)
+  
+  long_wt <- long_wt['2002-02/2017-06']
+  short_wt <- short_wt['2002-02/2017-06']
+  
+  # The following set of code shows how many stocks (roughly) will be traded
+  # for each long and short side.
+  sh_vec <- apply(short_wt,1,function(x) sum(x<0,na.rm=TRUE))
+  plot(sh_vec,type="l", main="Number of Stocks in Short Portfolio")
+  lg_vec <- apply(long_wt,1,function(x) sum(x>0,na.rm=TRUE))
+  plot(lg_vec,type="l",main="Number of Stocks in Long Portfolio")
+  
+  # Subset returns dataframe to only have returns for stocks whose betas were calculated
+  # First row is removed to match dimension of weight dataframes
+  stks <- df_all[,in_in][-1,] 
+  t_endpoints <- endpoints(stks, x)
+  stks <- stks[t_endpoints,]
+  stks <- stks['2002-02/2017-06']
+  stks[is.na(stks)] <- 0 # Convert NAs to 0s
+
+  # Pret_long is the portfolio return of the stocks that were bought
+  # Pret_short is the portfolio return of the stocks that were sold short
+  pret_long <- coredata(long_wt) * coredata(stks)
+  pret_short <- coredata(short_wt) * coredata(stks)
+  
+  # P is the sum (really weighted sum given returns were multiplied by weights above) of all the returns of stocks that were bought on a weekly 
+  # Same is true for S for the stocks that were sold short on a weekly basis
+  p <- apply(pret_long,1,sum) 
+  s <- apply(pret_short,1,sum)
+  pt <- cbind.data.frame(p,s) # combine both p & s into a dataframe
+  
+  if (x == "years"){
+    idx <- seq(as.Date("2003-01-01"),as.Date("2017-01-01"),by = x)
+  } else {
+    idx <- seq(as.Date("2002-02-07"),as.Date("2017-06-30"),by = x)
+  }
+  pt <- as.xts(pt,order.by = idx) # convert to xts object
+  # calculate total portfolio return if long and short portfolios were equal weighted
+  f <- p + s
+  f.ts <- as.xts(f,order.by = idx) # convert total portfolio return to xts object
+  
+# Cumulative return is then calculated and plotted. Anything below the horizontal line means the investment lost money. Other performance statistics are then plotted/printed using functions from the PerformanceAnalytics package.
+  cumret <- cumprod(1+f.ts)
+  plot.xts(cumret)
+  abline(h=1)
+  charts.PerformanceSummary(f.ts)
+  print(Return.annualized(f.ts))
+  print(SharpeRatio.annualized(f.ts))
+}
+```
+
+### Test Results for Weekly Rebalance:
+
+```{r w-rebal}
+bab_test("week")
+```
+
+### Test Results for Monthly Rebalance:
+
+```{r m-rebal}
+bab_test("months")
+```
+
+### Test Results for Quarterly Rebalance:
+
+```{r q-rebal}
+bab_test("quarter")
+```
+
+
+### Test Results for Annual Rebalance:
+
+```{r a-rebal}
+bab_test("years")
+```
+
+## CONCLUSION
+
+**Main Conclusion:**
+
+Unlike the authors of the research paper referenced in the beginning, I wasn't able to find any significant advantage from an investor that shorts high-beta stocks and buys long-beta stocks.
+
+**Limitations:**
+
+The discrepancy in these results versus the referenced research paper could be due to various reasons such as:
+1. Limitations in my dataset
+  + My dataset isn't as exhaustive and suffers from survivorship basis
+2. Calculation of beta on a daily frequency was too onerous for the purpose of this project, which differs from the approach taken in the research paper

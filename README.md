@@ -16,3 +16,7 @@ This code attempts to reproduce the study. However, due to various data limitati
 DATA:
 
 Most of the data are sourced via Quantmod or CSV file on this GitHub. However, there is a large zip file with daily prices for a large number of stocks downloaded from [Quandl.com](https://www.Quandl.com). The only way to ensure 100% complete reproducibility of this project is to make this large zip file available via my [Dropbox](https://www.dropbox.com/sh/fzih0uypabr2a99/AAA_i1aa5XG1NpAQIttH2Tdna?dl=0). This file needs to be downloaded and extracted. The CSV that will be extracted is about 1.8gbs. This CSV should be extracted in the folder you'll ultimately set as your working directory and rename the CSV file to "WIKI_PRICES_ALL.csv".
+
+PLEASE NOTE:
+
+First time this code is executed, it takes about an hour from start to finish running on an average Ubuntu computer (a bit longer on an average Windows PC). Subsequent runs are seamless once betas and prices are saved in SQLite.
